@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>XBX Online POS</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://apis.google.com/js/api.js"></script>
 <style>
 :root{
   --bg:#0f1320; --bg2:#161b2c; --card:#1b2236; --card2:#212a42;
@@ -37,7 +38,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);}
 .btn{background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#1a1208; font-weight:700; padding:12px; border-radius:12px; width:100%; font-size:15px; letter-spacing:.3px;}
 .btn:active{transform:scale(.98);}
 .btn-outline{background:transparent; border:1px solid var(--line); color:var(--txt); font-weight:600;}
-.btn-sm{padding:8px 12px; font-size:13px; border-radius:9px;}
+.btn-sm{padding:8px 12px; font-size:13px; border-radius:9px; width:auto;}
 .btn-danger{background:var(--bad); color:#fff;}
 .btn-good{background:var(--good); color:#063;}
 .btn-info{background:var(--info); color:#062b52;}
@@ -116,6 +117,13 @@ tbody tr:hover{background:var(--card2);}
 .empty{text-align:center; color:var(--muted); padding:40px 10px; font-size:13.5px;}
 .actions{display:flex; gap:6px; flex-wrap:wrap;}
 ::-webkit-scrollbar{width:8px; height:8px;} ::-webkit-scrollbar-thumb{background:var(--line); border-radius:10px;}
+.sync-status{font-size:12px; color:var(--txt2); display:flex; align-items:center; gap:6px;}
+.sync-status .online{color:var(--good);}
+.sync-status .offline{color:var(--bad);}
+.sync-status .syncing{color:var(--accent2);}
+.folder-check{font-size:12px; padding:6px 12px; border-radius:8px; background:var(--card2); display:inline-flex; align-items:center; gap:8px;}
+.folder-check.ok{color:var(--good); border:1px solid var(--good);}
+.folder-check.bad{color:var(--bad); border:1px solid var(--bad);}
 </style>
 </head>
 <body>
@@ -128,11 +136,11 @@ tbody tr:hover{background:var(--card2);}
     <p>Multi-Store Inventory &amp; Point of Sale</p>
     <div class="field" style="text-align:left">
       <label>Username</label>
-      <input id="liUser" placeholder="Username">
+      <input id="liUser" placeholder="Username" value="admin">
     </div>
     <div class="field" style="text-align:left">
       <label>Password</label>
-      <input id="liPass" type="password" placeholder="Password">
+      <input id="liPass" type="password" placeholder="Password" value="admin123">
     </div>
     <div class="err" id="liErr"></div>
     <button class="btn" onclick="doLogin()">Login</button>
@@ -154,6 +162,8 @@ tbody tr:hover{background:var(--card2);}
         </div>
       </div>
       <div class="row">
+        <div class="sync-status" id="syncStatus">📡 <span id="syncText">Loading...</span></div>
+        <button class="iconbtn" onclick="syncNow()" title="Sync Now">🔄</button>
         <button class="iconbtn" onclick="toggleTheme()" title="Dark/Light">🌗</button>
         <button class="iconbtn" onclick="logout()" title="Logout">⏻</button>
       </div>
@@ -166,11 +176,269 @@ tbody tr:hover{background:var(--card2);}
 <div class="toast" id="toast"></div>
 
 <script>
+/* ============================= GOOGLE DRIVE SYNC ============================= */
+const CLIENT_ID = '1095831268065-rr7gk8t9uqbhb9dohvq02thm6r98364h.apps.googleusercontent.com';
+const API_KEY = 'AIzaSyDp0mZvQlY7-pUq96DBaAAKfYXYaRPITGw';
+const SCOPES = 'https://www.googleapis.com/auth/drive.file';
+const DB_FILE_NAME = 'xbx_pos_db.json';
+
+let driveSync = {
+  initialized: false,
+  token: null,
+  online: false,
+  syncing: false,
+  fileId: null,
+  folderId: null
+};
+
+function getFolderId() {
+  // Use folder from settings or default
+  let folder = DB.settings.driveFolderId || '1rhEnLldnxkFqnsF2lajpdHFX62S4Dfms';
+  driveSync.folderId = folder;
+  return folder;
+}
+
+function initDriveAPI() {
+  return new Promise((resolve) => {
+    if (driveSync.initialized) { resolve(); return; }
+    gapi.load('client:auth2', function() {
+      gapi.client.init({
+        apiKey: API_KEY,
+        clientId: CLIENT_ID,
+        scope: SCOPES,
+        discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest']
+      }).then(() => {
+        driveSync.initialized = true;
+        getFolderId();
+        const auth = gapi.auth2.getAuthInstance();
+        if (auth.isSignedIn.get()) {
+          driveSync.token = auth.currentUser.get().getAuthResponse().access_token;
+          driveSync.online = true;
+          updateSyncStatus('online', 'Connected');
+          checkFolderAccess();
+        } else {
+          driveSync.online = false;
+          updateSyncStatus('offline', 'Sign in to sync');
+        }
+        resolve();
+      }).catch(err => {
+        console.error('Drive init error:', err);
+        driveSync.online = false;
+        updateSyncStatus('offline', 'Error');
+        resolve();
+      });
+    });
+  });
+}
+
+function updateSyncStatus(status, text) {
+  const el = document.getElementById('syncStatus');
+  const txt = document.getElementById('syncText');
+  if (el) {
+    el.className = 'sync-status';
+    if (status === 'online') el.classList.add('online');
+    else if (status === 'offline') el.classList.add('offline');
+    else if (status === 'syncing') el.classList.add('syncing');
+  }
+  if (txt) txt.textContent = text;
+}
+
+function signInToDrive() {
+  const auth = gapi.auth2.getAuthInstance();
+  auth.signIn().then(() => {
+    driveSync.token = auth.currentUser.get().getAuthResponse().access_token;
+    driveSync.online = true;
+    updateSyncStatus('online', 'Connected');
+    toast('Signed in to Google Drive');
+    checkFolderAccess();
+    loadFromDrive().then(() => {
+      syncNow();
+    });
+  }).catch(err => {
+    toast('Failed to sign in: ' + err.message);
+  });
+}
+
+async function checkFolderAccess() {
+  try {
+    const resp = await gapi.client.drive.files.get({
+      fileId: getFolderId(),
+      fields: 'id,name'
+    });
+    const folder = resp.result;
+    if (folder && folder.id) {
+      toast('✅ Folder found: ' + folder.name);
+      return true;
+    }
+  } catch(e) {
+    toast('⚠️ Folder not found or no access. Check Folder ID.');
+    console.error('Folder check error:', e);
+    return false;
+  }
+}
+
+async function syncNow() {
+  if (driveSync.syncing) {
+    toast('Sync already in progress');
+    return;
+  }
+  if (!driveSync.online || !driveSync.token) {
+    signInToDrive();
+    return;
+  }
+  
+  // Check folder access first
+  const hasAccess = await checkFolderAccess();
+  if (!hasAccess) {
+    toast('⚠️ Cannot access folder. Please check Folder ID');
+    return;
+  }
+  
+  driveSync.syncing = true;
+  updateSyncStatus('syncing', 'Syncing...');
+  
+  try {
+    await uploadDBToDrive();
+    driveSync.syncing = false;
+    updateSyncStatus('online', 'Synced ✓');
+    toast('Data synced to Google Drive');
+  } catch(err) {
+    driveSync.syncing = false;
+    updateSyncStatus('offline', 'Sync failed');
+    toast('Sync failed: ' + err.message);
+    console.error('Sync error:', err);
+  }
+}
+
+async function findDBFile() {
+  try {
+    const folderId = getFolderId();
+    const resp = await gapi.client.drive.files.list({
+      q: `name='${DB_FILE_NAME}' and '${folderId}' in parents and trashed=false`,
+      fields: 'files(id,name,version)',
+      pageSize: 1
+    });
+    const files = resp.result.files;
+    return files && files.length > 0 ? files[0] : null;
+  } catch(e) {
+    console.error('Find file error:', e);
+    return null;
+  }
+}
+
+async function uploadDBToDrive() {
+  const data = JSON.stringify(DB);
+  const blob = new Blob([data], { type: 'application/json' });
+  const folderId = getFolderId();
+  
+  // Find existing file
+  const existing = await findDBFile();
+  
+  if (existing) {
+    // Update existing file
+    driveSync.fileId = existing.id;
+    const formData = new FormData();
+    formData.append('metadata', new Blob([JSON.stringify({})], { type: 'application/json' }));
+    formData.append('file', blob);
+    
+    const resp = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${existing.id}?uploadType=multipart`, {
+      method: 'PATCH',
+      headers: { 'Authorization': 'Bearer ' + driveSync.token },
+      body: formData
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error('Upload failed: ' + err);
+    }
+  } else {
+    // Create new file
+    const metadata = {
+      name: DB_FILE_NAME,
+      parents: [folderId],
+      mimeType: 'application/json'
+    };
+    const formData = new FormData();
+    formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+    formData.append('file', blob);
+    
+    const resp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + driveSync.token },
+      body: formData
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error('Create failed: ' + err);
+    }
+    const result = await resp.json();
+    driveSync.fileId = result.id;
+  }
+  return true;
+}
+
+async function loadFromDrive() {
+  if (!driveSync.online || !driveSync.token) {
+    return false;
+  }
+  try {
+    const folderId = getFolderId();
+    // Check folder access first
+    try {
+      await gapi.client.drive.files.get({ fileId: folderId, fields: 'id' });
+    } catch(e) {
+      console.log('Folder not accessible:', folderId);
+      return false;
+    }
+    
+    const file = await findDBFile();
+    if (!file) {
+      console.log('No existing DB file found in Drive');
+      return false;
+    }
+    driveSync.fileId = file.id;
+    
+    const resp = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+      headers: { 'Authorization': 'Bearer ' + driveSync.token }
+    });
+    if (!resp.ok) throw new Error('Download failed');
+    const data = await resp.text();
+    const remoteDB = JSON.parse(data);
+    
+    // Merge: Use remote if it has newer version or if local is empty
+    const localVersion = localStorage.getItem('xbx_pos_db_version') || '0';
+    const remoteVersion = remoteDB._version || '0';
+    
+    if (remoteVersion > localVersion || !localStorage.getItem(DB_KEY)) {
+      DB = remoteDB;
+      localStorage.setItem(DB_KEY, JSON.stringify(DB));
+      localStorage.setItem('xbx_pos_db_version', remoteVersion);
+      toast('Loaded latest data from Drive');
+      return true;
+    }
+    return false;
+  } catch(e) {
+    console.error('Load from Drive error:', e);
+    return false;
+  }
+}
+
+// Auto-sync function - called after every save
+let syncTimeout = null;
+function autoSyncToDrive() {
+  if (syncTimeout) clearTimeout(syncTimeout);
+  syncTimeout = setTimeout(() => {
+    if (driveSync.online && !driveSync.syncing) {
+      uploadDBToDrive().catch(() => {});
+    }
+  }, 2000);
+}
+
 /* ============================= DB (localStorage) ============================= */
 const DB_KEY='xbx_pos_db_v1';
 function defaultDB(){
   return {
-    settings:{ whatsapp:'', driveId:'', usdRate:130, theme:'dark', refreshTypes:['Lunch','Tea','Transport','Office Supplies','Other'] },
+    _version: Date.now().toString(),
+    settings:{ whatsapp:'', usdRate:130, theme:'dark', refreshTypes:['Lunch','Tea','Transport','Office Supplies','Other'], driveFolderId:'1rhEnLldnxkFqnsF2lajpdHFX62S4Dfms' },
     stores:[{id:gid(),name:'Main Store',code:'STR-001',location:'Hargeisa',phone:'',email:'',manager:'',active:true}],
     categories:['Beverages','Snacks','Groceries','Electronics','Other'],
     products:[],
@@ -186,8 +454,13 @@ function defaultDB(){
 }
 function gid(){return 'id'+Date.now()+Math.random().toString(36).slice(2,7);}
 let DB = JSON.parse(localStorage.getItem(DB_KEY) || 'null') || defaultDB();
-function save(){ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }
-save();
+function save(){ 
+  DB._version = Date.now().toString();
+  localStorage.setItem(DB_KEY, JSON.stringify(DB));
+  localStorage.setItem('xbx_pos_db_version', DB._version);
+  // Auto sync to Drive
+  autoSyncToDrive();
+}
 
 /* ============================= STATE ============================= */
 let SESSION = JSON.parse(sessionStorage.getItem('xbx_session')||'null');
@@ -195,7 +468,7 @@ let currency = 'ETB';
 let cart = [];
 
 /* ============================= UTIL ============================= */
-function toast(msg){const t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; clearTimeout(window._tt); window._tt=setTimeout(()=>t.style.display='none',2200);}
+function toast(msg){const t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; clearTimeout(window._tt); window._tt=setTimeout(()=>t.style.display='none',3200);}
 function fmt(n){ n = n||0; if(currency==='USD'){ return '$'+(n/DB.settings.usdRate).toFixed(2);} return n.toLocaleString(undefined,{maximumFractionDigits:0})+' ETB';}
 function todayStr(){return new Date().toISOString().slice(0,10);}
 function monthStr(){return new Date().toISOString().slice(0,7);}
@@ -238,15 +511,27 @@ function myStoreIds(){
 function storeName(id){const s=DB.stores.find(x=>x.id===id); return s?s.name:'—';}
 
 /* ============================= APP ENTRY ============================= */
-function enterApp(){
+async function enterApp(){
   document.getElementById('loginScreen').style.display='none';
   document.getElementById('app').classList.add('show');
   document.documentElement.setAttribute('data-theme', DB.settings.theme||'dark');
   buildSidebar();
   document.getElementById('whoText').textContent = SESSION.fullName+' • '+SESSION.role;
   document.getElementById('burger').style.display='';
+  
+  // Load from Drive
+  await loadFromDrive();
+  
   goto('dashboard');
+  
+  // Auto sync every 15 seconds
+  setInterval(() => {
+    if (driveSync.online && !driveSync.syncing) {
+      uploadDBToDrive().catch(() => {});
+    }
+  }, 15000);
 }
+
 function buildSidebar(){
   const items = NAV[SESSION.role]||[];
   let h = `<div class="brand"><img src="https://i.postimg.cc/Qx0p2GVk/file-00000000fa4c7246b72a6a8cfb5f877e.png"><div><b>XBX POS</b><span>Online Market</span></div></div>`;
@@ -852,6 +1137,7 @@ function delSheetRow(i){ if(!confirm('Delete this row?'))return; DB[SHEETS[sheet
 
 /* ============================= SETTINGS ============================= */
 function RENDER_settings(){
+  const folderId = DB.settings.driveFolderId || '1rhEnLldnxkFqnsF2lajpdHFX62S4Dfms';
   document.getElementById('content').innerHTML = `
   <div class="grid" style="grid-template-columns:1fr 1fr">
   <div class="card">
@@ -871,10 +1157,25 @@ function RENDER_settings(){
     <button class="btn btn-sm" style="width:auto" onclick="saveWa()">Save</button>
   </div>
   <div class="card">
-    <div class="section-title">Google Drive Folder ID</div>
-    <div class="field"><input id="driveId" value="${escapeHtml(DB.settings.driveId)}" placeholder="Folder ID"></div>
-    <button class="btn btn-sm" style="width:auto" onclick="saveDrive()">Save</button>
-    <p style="font-size:11.5px; color:var(--muted); margin-top:8px">Hub: si toos ah xogtu Drive ugama dirto interface-kan (web app-ku waa offline/local), laakin meesha aad geliso waa lagu kaydiyaa settings.</p>
+    <div class="section-title">🔑 Google Drive Folder ID</div>
+    <div class="field">
+      <label>Folder ID</label>
+      <input id="driveFolderInput" value="${escapeHtml(folderId)}" placeholder="Enter Google Drive Folder ID">
+    </div>
+    <div style="margin-top:8px">
+      <span class="folder-check ${folderId ? 'ok' : 'bad'}">
+        📁 ${folderId ? 'Folder ID set: ' + folderId.substring(0,10) + '...' : 'No folder ID set'}
+      </span>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px">
+      <button class="btn btn-sm btn-info" style="width:auto" onclick="saveDriveFolder()">💾 Save Folder ID</button>
+      <button class="btn btn-sm btn-outline" style="width:auto" onclick="checkFolderAccess()">🔍 Check Access</button>
+      <button class="btn btn-sm btn-good" style="width:auto" onclick="syncNow()">🔄 Sync Now</button>
+    </div>
+    <p style="font-size:11.5px; color:var(--muted); margin-top:8px">
+      ✅ Markaad Folder ID beddesho, xogta cusub waxay ku kaydsan doontaa folder-ka cusub.
+      Browser kasta oo cusub waxaad ka heli doontaa xogta isku midka ah.
+    </p>
   </div>
   <div class="card">
     <div class="section-title">Appearance</div>
@@ -886,11 +1187,30 @@ function RENDER_settings(){
   </div>
   </div>`;
 }
+
+function saveDriveFolder() {
+  const folderId = document.getElementById('driveFolderInput').value.trim();
+  if (!folderId) {
+    toast('Please enter a valid Folder ID');
+    return;
+  }
+  DB.settings.driveFolderId = folderId;
+  driveSync.folderId = folderId;
+  save();
+  toast('✅ Folder ID saved: ' + folderId);
+  RENDER_settings();
+  
+  // Check if folder is accessible
+  setTimeout(() => {
+    checkFolderAccess();
+  }, 500);
+}
+
 function saveAdmin(){ const u=DB.users[0]; u.username=val('adUser')||u.username; const p=val('adPass'); if(p) u.password=p; save(); toast('Admin updated'); }
 function addRefType(){ const v=val('rtNew'); if(!v)return; DB.settings.refreshTypes.push(v); save(); RENDER_settings(); }
 function delRefType(t){ DB.settings.refreshTypes=DB.settings.refreshTypes.filter(x=>x!==t); save(); RENDER_settings(); }
 function saveWa(){ DB.settings.whatsapp=val('waNum'); save(); toast('Saved'); }
-function saveDrive(){ DB.settings.driveId=val('driveId'); save(); toast('Saved'); }
+
 function resetAll(){ if(!confirm('This will erase ALL data. Continue?'))return; localStorage.removeItem(DB_KEY); location.reload(); }
 
 /* ============================= ROUTER MAP ============================= */
@@ -901,8 +1221,23 @@ const RENDER = {dashboard:RENDER_dashboard, sell:RENDER_sell, todaysell:RENDER_t
 
 /* ============================= BOOT ============================= */
 document.documentElement.setAttribute('data-theme', DB.settings.theme||'dark');
-if(SESSION){ enterApp(); }
+
+// Init Google Drive API
+initDriveAPI().then(() => {
+  if(SESSION){ 
+    enterApp();
+  }
+}).catch(() => {
+  if(SESSION){ 
+    enterApp();
+  }
+});
+
 document.getElementById('liPass')?.addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
+
+console.log('✅ XBX POS is running with Google Drive sync');
+console.log('📁 Current Drive Folder ID:', getFolderId());
+console.log('📄 DB File:', DB_FILE_NAME);
 </script>
 </body>
 </html>
